@@ -12,6 +12,7 @@ env/
 ENV/
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 secrets.yaml
