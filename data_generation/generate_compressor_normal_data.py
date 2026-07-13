@@ -89,20 +89,77 @@ def fouling_sawtooth(n: int, low: float, high: float, cycle_days: tuple[float, f
     return values
 
 
-def build_load_series(n: int, rng: np.random.Generator) -> np.ndarray:
-    """Piecewise target load (operator setpoint changes) smoothed by control-loop lag."""
+def build_load_series(
+    n: int, rng: np.random.Generator, load_center: np.ndarray, load_std: np.ndarray
+) -> np.ndarray:
+    """Piecewise target load (operator setpoint changes) smoothed by control-loop lag.
+
+    `load_center`/`load_std` are per-minute arrays (from the active process
+    grade) so short-term load wander happens around the current grade's
+    typical throughput, not a single fixed setpoint.
+    """
     minutes_per_day = 1440
     targets = np.empty(n)
     idx = 0
     while idx < n:
         seg_len = int(rng.uniform(0.5, 4.0) * minutes_per_day)
         seg_len = max(1, min(seg_len, n - idx))
-        target = np.clip(rng.normal(0.88, 0.09), 0.55, 1.02)
+        target = np.clip(rng.normal(load_center[idx], load_std[idx]), 0.5, 1.05)
         targets[idx : idx + seg_len] = target
         idx += seg_len
     smoothed = pd.Series(targets).ewm(span=30, adjust=False).mean().to_numpy().copy()
     smoothed += rng.normal(0.0, 0.004, n)
-    return np.clip(smoothed, 0.5, 1.05)
+    return np.clip(smoothed, 0.45, 1.08)
+
+
+# Three process grades this compressor normally runs: different feed gas
+# composition (MW/Z-factor) and correspondingly different discharge pressure
+# and flow targets. All still "normal" — the autoencoder needs to learn all
+# three as valid operating regions, not just noise around one point.
+GRADES = [
+    {"name": "grade_A", "mw_factor": 1.00, "z_offset": 0.000, "discharge_press_factor": 1.00, "flow_factor": 1.00, "load_center": 0.90, "load_std": 0.06},
+    {"name": "grade_B", "mw_factor": 1.15, "z_offset": -0.018, "discharge_press_factor": 1.07, "flow_factor": 0.90, "load_center": 0.80, "load_std": 0.06},
+    {"name": "grade_C", "mw_factor": 0.88, "z_offset": 0.022, "discharge_press_factor": 0.94, "flow_factor": 1.08, "load_center": 0.85, "load_std": 0.06},
+]
+
+
+def build_grade_series(
+    n: int, rng: np.random.Generator, campaign_days: tuple[float, float] = (10, 35), ramp_hours: float = 8
+) -> dict[str, np.ndarray]:
+    """Discrete grade campaigns (days-to-weeks long) with a smooth ramp between them.
+
+    Returns per-minute arrays: a `grade_name` label (nominal grade, ignoring
+    the ramp) plus smoothly-transitioning `mw_factor`/`z_offset`/
+    `discharge_press_factor`/`flow_factor`/`load_center`/`load_std`.
+    """
+    minutes_per_day = 1440
+    grade_idx = np.empty(n, dtype=int)
+    idx = 0
+    last_grade = -1
+    while idx < n:
+        choices = [i for i in range(len(GRADES)) if i != last_grade]
+        g = rng.choice(choices) if last_grade != -1 else int(rng.integers(0, len(GRADES)))
+        seg_len = int(rng.uniform(*campaign_days) * minutes_per_day)
+        seg_len = max(1, min(seg_len, n - idx))
+        grade_idx[idx : idx + seg_len] = g
+        idx += seg_len
+        last_grade = g
+
+    span = ramp_hours * 60
+
+    def smooth(key: str) -> np.ndarray:
+        raw = np.array([GRADES[g][key] for g in grade_idx])
+        return pd.Series(raw).ewm(span=span, adjust=False).mean().to_numpy()
+
+    return {
+        "grade_name": np.array([GRADES[g]["name"] for g in grade_idx]),
+        "mw_factor": smooth("mw_factor"),
+        "z_offset": smooth("z_offset"),
+        "discharge_press_factor": smooth("discharge_press_factor"),
+        "flow_factor": smooth("flow_factor"),
+        "load_center": smooth("load_center"),
+        "load_std": smooth("load_std"),
+    }
 
 
 def build_ambient_series(timestamps: pd.DatetimeIndex, rng: np.random.Generator) -> np.ndarray:
@@ -128,7 +185,8 @@ def generate(n_days: int, start: str, freq: str, seed: int) -> pd.DataFrame:
     def s(tag: str) -> float:
         return stats[tag]["std"]
 
-    load = build_load_series(n, rng)
+    grade = build_grade_series(n, rng)
+    load = build_load_series(n, rng, grade["load_center"], grade["load_std"])
     load_ref = load.mean()
     load_frac = load / load_ref
     load_dev = load_frac - 1.0
@@ -152,7 +210,8 @@ def generate(n_days: int, start: str, freq: str, seed: int) -> pd.DataFrame:
     }
     for tag, tau in flow_tags.items():
         noise = ou_like_noise(n, tau, max(s(tag) * 0.4, m(tag) * 0.01), rng)
-        df[tag] = m(tag) * (0.35 + 0.65 * load_frac) + noise
+        grade_factor = grade["flow_factor"] if tag == "comp_flow_nm3h" else 1.0
+        df[tag] = m(tag) * grade_factor * (0.35 + 0.65 * load_frac) + noise
 
     # --- Pressure tags: mild positive sensitivity to load ---
     pressure_tags = {
@@ -166,7 +225,8 @@ def generate(n_days: int, start: str, freq: str, seed: int) -> pd.DataFrame:
     }
     for tag, tau in pressure_tags.items():
         noise = ou_like_noise(n, tau, max(s(tag) * 0.5, m(tag) * 0.015), rng)
-        df[tag] = m(tag) * (1 + 0.35 * load_dev) + noise
+        grade_factor = grade["discharge_press_factor"] if tag == "comp_discharge_press_barg" else 1.0
+        df[tag] = m(tag) * grade_factor * (1 + 0.35 * load_dev) + noise
 
     # --- Compressor speed: fixed-speed drive, near-constant ---
     df["comp_speed_rpm"] = m("comp_speed_rpm") * (1 + 0.01 * load_dev) + ou_like_noise(
@@ -198,7 +258,9 @@ def generate(n_days: int, start: str, freq: str, seed: int) -> pd.DataFrame:
     )
     df["comp_discharge_temp_c"] = (
         df["comp_suction_temp_c"]
-        + (m("comp_discharge_temp_c") - m("comp_suction_temp_c")) * (1 + 0.4 * load_dev)
+        + (m("comp_discharge_temp_c") - m("comp_suction_temp_c"))
+        * grade["discharge_press_factor"]
+        * (1 + 0.4 * load_dev)
         + ou_like_noise(n, 30, s("comp_discharge_temp_c") * 0.6, rng)
     )
     df["coupling_temp_c"] = (
@@ -283,12 +345,14 @@ def generate(n_days: int, start: str, freq: str, seed: int) -> pd.DataFrame:
         n, 5, s("hx_energy_balance_residual_pct"), rng
     )
 
-    # --- Process spec: slow compositional drift ---
-    df["proc_gas_mw_kg_kmol"] = m("proc_gas_mw_kg_kmol") + ou_like_noise(
-        n, 2880, s("proc_gas_mw_kg_kmol"), rng
+    # --- Process spec: grade-driven composition shift + slow drift within a grade ---
+    df["proc_gas_mw_kg_kmol"] = m("proc_gas_mw_kg_kmol") * grade["mw_factor"] + ou_like_noise(
+        n, 2880, s("proc_gas_mw_kg_kmol") * 0.5, rng
     )
-    df["proc_gas_z_factor"] = m("proc_gas_z_factor") + ou_like_noise(
-        n, 2880, s("proc_gas_z_factor"), rng
+    df["proc_gas_z_factor"] = (
+        m("proc_gas_z_factor")
+        + grade["z_offset"]
+        + ou_like_noise(n, 2880, s("proc_gas_z_factor") * 0.5, rng)
     )
     df["proc_scrubber_level_pct"] = np.clip(
         m("proc_scrubber_level_pct") + ou_like_noise(n, 60, s("proc_scrubber_level_pct") * 1.5, rng),
@@ -319,6 +383,7 @@ def generate(n_days: int, start: str, freq: str, seed: int) -> pd.DataFrame:
     # --- Metadata / labels ---
     df["equipment_id"] = "C-101"
     df["operating_mode"] = "normal_operation"
+    df["process_grade"] = grade["grade_name"]
 
     # Reorder to match the source workbook's tag order.
     tag_order = [
@@ -338,7 +403,7 @@ def generate(n_days: int, start: str, freq: str, seed: int) -> pd.DataFrame:
         "hx_gas_outlet_temp_c", "hx_water_inlet_temp_c", "hx_water_outlet_temp_c",
         "hx_water_flow_m3h", "hx_energy_balance_residual_pct", "hx_approach_temp_c",
     ]
-    df = df[["equipment_id", "operating_mode"] + tag_order]
+    df = df[["equipment_id", "operating_mode", "process_grade"] + tag_order]
     return df.reset_index()
 
 

@@ -27,16 +27,28 @@ SENSOR_TAGS = [
 sensor_columns_sql = ",\n    ".join(f"[{tag}] FLOAT NULL" for tag in SENSOR_TAGS)
 
 
-DDL = f"""
+CREATE_DDL = f"""
 IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = '{TABLE_NAME}')
 BEGIN
     CREATE TABLE dbo.{TABLE_NAME} (
         [timestamp] DATETIME2(0) NOT NULL,
         [equipment_id] VARCHAR(20) NOT NULL,
         [operating_mode] VARCHAR(30) NOT NULL,
+        [process_grade] VARCHAR(20) NULL,
         {sensor_columns_sql},
         CONSTRAINT PK_{TABLE_NAME} PRIMARY KEY CLUSTERED ([equipment_id], [timestamp])
     );
+END
+"""
+
+# Backfills process_grade onto a table created before the grade feature existed.
+ADD_GRADE_COLUMN_DDL = f"""
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID('dbo.{TABLE_NAME}') AND name = 'process_grade'
+)
+BEGIN
+    ALTER TABLE dbo.{TABLE_NAME} ADD [process_grade] VARCHAR(20) NULL;
 END
 """
 
@@ -44,9 +56,10 @@ END
 def main() -> None:
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(DDL)
+    cursor.execute(CREATE_DDL)
+    cursor.execute(ADD_GRADE_COLUMN_DDL)
     conn.commit()
-    print(f"Table dbo.{TABLE_NAME} is ready ({len(SENSOR_TAGS)} sensor columns).")
+    print(f"Table dbo.{TABLE_NAME} is ready ({len(SENSOR_TAGS)} sensor columns + process_grade).")
     conn.close()
 
 
