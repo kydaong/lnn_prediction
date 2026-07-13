@@ -36,7 +36,9 @@ checkpoints/
 data/raw/
 data/processed/
 data/interim/
+data/features/
 *.parquet
+*.npz
 dump.rdb
 redis-data/
 docker-compose.override.yml

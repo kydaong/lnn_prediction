@@ -1,12 +1,4 @@
 """Generate synthetic compressor data in memory and insert it straight into LNN_data.
-
-No intermediate file is written — this calls the same simulation used by
-generate_compressor_normal_data.py and pipes the resulting DataFrame directly
-into dbo.compressor_normal_operation via to_sql.
-
-Usage:
-    .venv/Scripts/python.exe scripts/generate_and_load_compressor_data.py
-    .venv/Scripts/python.exe scripts/generate_and_load_compressor_data.py --days 90 --seed 7
 """
 import argparse
 import time
